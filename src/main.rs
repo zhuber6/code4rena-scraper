@@ -9,6 +9,8 @@ use serde::{Deserialize};
 use serde_json::{Value, json};
 use hex;
 
+use chrono::{DateTime, Utc, TimeZone, ParseError};
+
 use tracing::{error};
 
 use ethers_solc::{CompilerInput, Solc, CompilerOutput};
@@ -87,7 +89,7 @@ struct GitHubFile {
     encoding: String
 }
 
-fn get_contests(url: &str) -> Vec<Contest> {
+fn get_active_contests(url: &str) -> Vec<Contest> {
     let response = reqwest::blocking::get(url).unwrap().text().unwrap();
     let document = Html::parse_document(&response);
     let selector = Selector::parse("script").unwrap();
@@ -111,6 +113,7 @@ fn get_contests(url: &str) -> Vec<Contest> {
                 .unwrap()
                 .iter()
                 .filter_map(|contest| serde_json::from_value(contest.clone()).ok())
+                .filter(|contest| is_active(contest).unwrap_or(false))
                 .collect();
             contests
         }
@@ -119,6 +122,14 @@ fn get_contests(url: &str) -> Vec<Contest> {
             Vec::new()
         }
     }
+}
+
+fn is_active(contest: &Contest) -> Result<bool, ParseError> {
+    let current_time = Utc::now();
+    let end_time = contest.end_time.as_ref().unwrap();
+    let end_time = DateTime::parse_from_rfc3339(&end_time)?;
+    
+    Ok(end_time > current_time)
 }
 
 fn clone_contract(url: &str) -> Result<GitHubFile, reqwest::Error> {
@@ -253,56 +264,66 @@ fn get_contracts_bytecodes(contracts: Contracts, filename: &str) -> Option<Vec<(
 
 fn main() {
 
-    let contests = get_contests("https://code4rena.com/contests");
+    let contests = get_active_contests("https://code4rena.com/contests");
 
     // Fetch the repository's Git tree using the GitHub API
     let owner = "code-423n4";
-    let repo_url = contests[0].repo.as_ref().unwrap();
-    let url_parts: Vec<&str> = repo_url.split('/').collect();
-    let repo_name = url_parts.last().unwrap();
 
-    match get_default_branch(owner, repo_name) {
-        Ok(default_branch) => {
-            // println!("Default branch: {}", default_branch);
+    for contest in contests {
+        println!("id: {} status: {} sponsor: {}",
+            contest.contest_id.unwrap_or_default(),
+            contest.status.unwrap_or_default(),
+            contest.sponsor.unwrap_or_default()
+        );
+        let repo_url = contest.repo.as_ref().unwrap();
+        let url_parts: Vec<&str> = repo_url.split('/').collect();
+        let repo_name = url_parts.last().unwrap();
 
-            let github_api_url = "https://api.github.com/repos";
-            let api_url = format!("{}/{}/{}/git/trees/{}?recursive=1", github_api_url, owner, repo_name, default_branch);
+        match get_default_branch(owner, repo_name) {
+            Ok(default_branch) => {
+                println!("Default branch: {}", default_branch);
 
-            match get_contracts_urls(&api_url) {
-                Ok(contract_data) => {
-                    for (url, filename) in contract_data {
-                        // Fetch the contract content using the contract URL
-                        if filename != "Strings.sol" {
-                            continue;
-                        }
-                        println!("// Solidity contract URL: {}", url);
-                        println!("// Solidity contract filename: {}", filename);
-                        let contract = clone_contract(&url).unwrap();
-                        let contract_content = contract.content.clone().replace("\n", "");
-                        let contract_decoded_content = b64::STANDARD.decode(contract_content).unwrap();
-                        let contract_decoded_string = String::from_utf8_lossy(&contract_decoded_content);
-                        // println!("\n\n{}", contract_decoded_string);
-                        
-                        let compiled_contracts = compile_contract(&filename, &contract_decoded_string).unwrap();
+                let github_api_url = "https://api.github.com/repos";
+                let api_url = format!("{}/{}/{}/git/trees/{}?recursive=1", github_api_url, owner, repo_name, default_branch);
 
-                        if let Some(contracts_bytecodes) = get_contracts_bytecodes(compiled_contracts, &filename) {
-                            for (contract_name, bytecode) in contracts_bytecodes {
-                                println!("Contract Name: {}", contract_name);
-                                println!("Bytecode: {}", bytecode);
+                println!("api_url: {}", api_url);
+
+                match get_contracts_urls(&api_url) {
+                    Ok(contract_data) => {
+                        for (url, filename) in contract_data {
+                            // Fetch the contract content using the contract URL
+                            // if filename != "Strings.sol" {
+                            //     continue;
+                            // }
+                            println!("// Solidity contract URL: {}", url);
+                            println!("// Solidity contract filename: {}", filename);
+                            let contract = clone_contract(&url).unwrap();
+                            let contract_content = contract.content.clone().replace("\n", "");
+                            let contract_decoded_content = b64::STANDARD.decode(contract_content).unwrap();
+                            let contract_decoded_string = String::from_utf8_lossy(&contract_decoded_content);
+                            // println!("\n\n{}", contract_decoded_string);
+                            
+                            let compiled_contracts = compile_contract(&filename, &contract_decoded_string).unwrap();
+
+                            if let Some(contracts_bytecodes) = get_contracts_bytecodes(compiled_contracts, &filename) {
+                                for (contract_name, bytecode) in contracts_bytecodes {
+                                    // println!("Contract Name: {}", contract_name);
+                                    // println!("Bytecode: {}", bytecode);
+                                }
+                            } else {
+                                println!("No contracts found in the specified file.");
                             }
-                        } else {
-                            println!("No contracts found in the specified file.");
                         }
                     }
-                }
-                Err(err) => {
-                    eprintln!("Error fetching GitHub repository contents: {}", err);
+                    Err(err) => {
+                        eprintln!("Error fetching GitHub repository contents: {}", err);
+                    }
                 }
             }
-        }
-        Err(err) => {
-            println!("Error: {:?}", err);
-            // Handle the error case
+            Err(err) => {
+                println!("Error: {:?}", err);
+                // Handle the error case
+            }
         }
     }
 }
