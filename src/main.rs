@@ -3,6 +3,8 @@ use reqwest;
 use scraper::{Html, Selector};
 use base64::{Engine as _, engine::general_purpose as b64};
 
+use dotenv;
+
 use serde::{Deserialize};
 use serde_json::{Value};
 
@@ -115,6 +117,7 @@ fn clone_contract(url: &str) -> Result<GitHubFile, reqwest::Error> {
     let response = client
         .get(url)
         .header("User-Agent", "MyApp")
+        .header("Authorization", format!("Bearer {}", std::env::var("GITHUB_PA_TOKEN").unwrap()))
         .send()?
         .json::<GitHubFile>()?;
         // .send()?
@@ -130,6 +133,7 @@ fn get_contracts_urls(api_url: &str) -> Result<Vec<(String, String)>, reqwest::E
     let response = client
         .get(api_url)
         .header("User-Agent", "MyApp")
+        .header("Authorization", format!("Bearer {}", std::env::var("GITHUB_PA_TOKEN").unwrap()))
         .send()?
         .json::<GitHubTree>()?;
 
@@ -145,7 +149,7 @@ fn get_contracts_urls(api_url: &str) -> Result<Vec<(String, String)>, reqwest::E
                 .and_then(|filename| filename.to_str())
                 .unwrap_or(&entry.path);
 
-            (entry.url, filename.to_string())
+            (entry.url, entry.path)
         })
         .collect();
 
@@ -157,10 +161,13 @@ fn get_default_branch(owner: &str, repo: &str) -> Result<String, Box<dyn std::er
     let github_api_url = "https://api.github.com/repos";
     let url = format!("{}/{}/{}", github_api_url, owner, repo);
 
+    dotenv::dotenv().ok();
+
     let client = reqwest::blocking::Client::new();
     let response = client
         .get(&url)
         .header("User-Agent", "MyApp")
+        .header("Authorization", format!("Bearer {}", std::env::var("GITHUB_PA_TOKEN").unwrap()))
         .send()
         .map_err(|err| {
             error!("Failed to send request to GitHub API: {}", err);
@@ -186,9 +193,11 @@ fn main() {
 
     // Fetch the repository's Git tree using the GitHub API
     let owner = "code-423n4";
-    let repo_url = contests[0].repo.as_ref().unwrap();
+    let repo_url = contests[1].repo.as_ref().unwrap();
     let url_parts: Vec<&str> = repo_url.split('/').collect();
     let repo_name = url_parts.last().unwrap();
+
+    println!("repo_name: {}", repo_name);
 
     match get_default_branch(owner, repo_name) {
         Ok(default_branch) => {
@@ -214,8 +223,6 @@ fn main() {
                     eprintln!("Error fetching GitHub repository contents: {}", err);
                 }
             }
-            
-            // println!("response: {}", solidity_contracts);
         }
         Err(err) => {
             println!("Error: {:?}", err);
