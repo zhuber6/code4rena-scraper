@@ -15,10 +15,14 @@ use tracing::{error};
 
 use ethers_solc::{CompilerInput, Solc, CompilerOutput};
 use ethers_solc::artifacts::{
-    Contract, Source, StandardJsonCompilerInput, Contracts, BytecodeObject
+    Contract, Source, StandardJsonCompilerInput, Contracts, BytecodeObject, Settings
 };
+use ethers_solc::artifacts::output_selection::OutputSelection;
+use ethers_solc::remappings::{Remapping};
 use std::collections::{HashMap, BTreeMap};
 use std::path::{Path, PathBuf};
+
+use git2::{Repository};
 
 #[allow(non_snake_case)]
 #[allow(dead_code)]
@@ -113,7 +117,7 @@ fn get_active_contests(url: &str) -> Vec<Contest> {
                 .unwrap()
                 .iter()
                 .filter_map(|contest| serde_json::from_value(contest.clone()).ok())
-                .filter(|contest| is_active(contest).unwrap_or(false))
+                .filter(|contest| is_active_and_public(contest).unwrap_or(false))
                 .collect();
             contests
         }
@@ -124,12 +128,12 @@ fn get_active_contests(url: &str) -> Vec<Contest> {
     }
 }
 
-fn is_active(contest: &Contest) -> Result<bool, ParseError> {
+fn is_active_and_public(contest: &Contest) -> Result<bool, ParseError> {
     let current_time = Utc::now();
     let end_time = contest.end_time.as_ref().unwrap();
     let end_time = DateTime::parse_from_rfc3339(&end_time)?;
     
-    Ok(end_time > current_time)
+    Ok(end_time > current_time && contest.code_access.as_ref().unwrap() == "public")
 }
 
 fn clone_contract(url: &str) -> Result<GitHubFile, reqwest::Error> {
@@ -147,6 +151,7 @@ fn clone_contract(url: &str) -> Result<GitHubFile, reqwest::Error> {
     
     Ok(response)
 }
+
 
 fn get_contracts_urls(api_url: &str) -> Result<Vec<(String, String)>, reqwest::Error> {
     dotenv::dotenv().ok();
@@ -196,8 +201,6 @@ fn get_default_branch(owner: &str, repo: &str) -> Result<String, Box<dyn std::er
             error!("Failed to send request to GitHub API: {}", err);
         })
         .unwrap();
-    
-    // println!("response: {:?}", response);
 
     if response.status().is_success() {
         let json: serde_json::Value = response.json()?;
@@ -212,8 +215,8 @@ fn get_default_branch(owner: &str, repo: &str) -> Result<String, Box<dyn std::er
     Err("Default branch not found".into())
 }
 
-// fn compile_contract(filename: &str, source_code: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-fn compile_contract(filename: &str, source_code: &str) -> Result<Contracts, Box<dyn std::error::Error>> {
+
+fn compile_contract_from_source(filename: &str, source_code: &str) -> Result<Contracts, Box<dyn std::error::Error>> {
     // Create a Solc instance
     let solc = Solc::default();
 
@@ -230,6 +233,7 @@ fn compile_contract(filename: &str, source_code: &str) -> Result<Contracts, Box<
 
     Ok(output.clone().contracts)
 }
+
 
 fn get_contracts_bytecodes(contracts: Contracts, filename: &str) -> Option<Vec<(String, String)>> {
     // Access the contracts for the specified file name
@@ -261,6 +265,56 @@ fn get_contracts_bytecodes(contracts: Contracts, filename: &str) -> Option<Vec<(
     None
 }
 
+fn read_remappings_file(file_path: &str) -> Vec<Remapping> {
+    let contents = std::fs::read_to_string(file_path)
+        .expect("Failed to read remappings file");
+
+    let file_path_wout_remappings = Path::new(file_path)
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut remappings = Vec::new();
+
+    for line in contents.lines() {
+        let parts: Vec<&str> = line.trim().split('=').collect();
+        if parts.len() == 2 {
+            let name = parts[0].trim().to_string();
+            let mut path = parts[1].trim().to_string();
+            path.insert_str(0, "/");    // add leading slash
+            path.insert_str(0, &file_path_wout_remappings);
+            let remapping = Remapping { name, path };
+            remappings.push(remapping);
+        }
+    }
+
+    remappings
+}
+
+fn clone_repo(repo_url: &str, local_path: &str) -> Result<(), git2::Error> {
+    let repo = Repository::clone_recurse(repo_url, local_path)?;
+    Ok(())
+}
+
+
+fn compile_contracts_from_repo(contracts_path: &str, remappings_path: &str) -> Result<(Contracts), Box<dyn std::error::Error>> {
+    let solc = Solc::default();
+    let input = CompilerInput::new(contracts_path)?;
+    let mut settings = Settings::new(OutputSelection::default_output_selection());
+    settings = Settings::with_via_ir(settings);
+    
+    let remappings = read_remappings_file(remappings_path);
+    settings.remappings = remappings;
+    let input = CompilerInput::settings(input[0].clone(), settings);
+    // println!("input: {:?}", input);
+    let output = solc.compile(&input)?;
+
+    // println!("output: {:?}", output.clone().contracts);
+    Ok(output.clone().contracts)
+}
+
 
 fn main() {
 
@@ -270,60 +324,43 @@ fn main() {
     let owner = "code-423n4";
 
     for contest in contests {
-        println!("id: {} status: {} sponsor: {}",
-            contest.contest_id.unwrap_or_default(),
-            contest.status.unwrap_or_default(),
-            contest.sponsor.unwrap_or_default()
-        );
         let repo_url = contest.repo.as_ref().unwrap();
         let url_parts: Vec<&str> = repo_url.split('/').collect();
         let repo_name = url_parts.last().unwrap();
+        let local_path = format!("./clones/{}", repo_name);
 
-        match get_default_branch(owner, repo_name) {
-            Ok(default_branch) => {
-                println!("Default branch: {}", default_branch);
-
-                let github_api_url = "https://api.github.com/repos";
-                let api_url = format!("{}/{}/{}/git/trees/{}?recursive=1", github_api_url, owner, repo_name, default_branch);
-
-                println!("api_url: {}", api_url);
-
-                match get_contracts_urls(&api_url) {
-                    Ok(contract_data) => {
-                        for (url, filename) in contract_data {
-                            // Fetch the contract content using the contract URL
-                            // if filename != "Strings.sol" {
-                            //     continue;
-                            // }
-                            println!("// Solidity contract URL: {}", url);
-                            println!("// Solidity contract filename: {}", filename);
-                            let contract = clone_contract(&url).unwrap();
-                            let contract_content = contract.content.clone().replace("\n", "");
-                            let contract_decoded_content = b64::STANDARD.decode(contract_content).unwrap();
-                            let contract_decoded_string = String::from_utf8_lossy(&contract_decoded_content);
-                            // println!("\n\n{}", contract_decoded_string);
-                            
-                            let compiled_contracts = compile_contract(&filename, &contract_decoded_string).unwrap();
-
-                            if let Some(contracts_bytecodes) = get_contracts_bytecodes(compiled_contracts, &filename) {
-                                for (contract_name, bytecode) in contracts_bytecodes {
-                                    // println!("Contract Name: {}", contract_name);
-                                    // println!("Bytecode: {}", bytecode);
-                                }
-                            } else {
-                                println!("No contracts found in the specified file.");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("Error fetching GitHub repository contents: {}", err);
-                    }
+        // Check if the local path exists
+        if std::fs::metadata(&local_path).is_err() {
+            let result = std::panic::catch_unwind(|| {
+                clone_repo(repo_url, &local_path)
+            });
+        
+            match result {
+                Ok(Ok(())) => println!("{} cloned successfully.", repo_name),
+                Ok(Err(err)) => {
+                    // eprintln!("Failed to clone {}: {}", repo_name, err);
+                    continue;
                 }
-            }
-            Err(err) => {
-                println!("Error: {:?}", err);
-                // Handle the error case
+                Err(_) => println!("Ignoring repository due to lack of access."),
             }
         }
+
+        let contracts_path = local_path.clone() + "/src";
+        let remappings_path = local_path.clone() + "/remappings.txt";
+        let output = compile_contracts_from_repo(&contracts_path, &remappings_path);
+
+        // let contract_filename = "xyz.sol";
+
+        // if let Some(contracts_bytecodes) = get_contracts_bytecodes(compiled_contracts, &filename) {
+        //     for (contract_name, bytecode) in contracts_bytecodes {
+        //         println!("Contract Name: {}", contract_name);
+        //         println!("Bytecode: {}", bytecode);
+        //     }
+        // } else {
+        //     println!("No contracts found in the specified file.");
+        // }
+
+        // println!("{:?}", output);
+        // break;
     }
 }
